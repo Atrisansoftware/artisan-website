@@ -1,0 +1,8 @@
+# robots.txt for artisanengineering.com.np
+# Artisan Engineering and Builders Pvt. Ltd.
+
+User-agent: *
+Allow: /
+Disallow: /api/
+
+Sitemap: https://artisanengineering.com.np/sitemap.xml
