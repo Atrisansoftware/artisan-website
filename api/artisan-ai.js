@@ -1,36 +1,37 @@
 // api/artisan-ai.js
 // Serverless function (Vercel-style) that powers the "Artisan AI" chat widget.
 // The frontend (index.html) calls POST /api/artisan-ai — this file is the ONLY
-// place your Gemini API key should ever exist. It never touches the browser.
+// place your Groq API key should ever exist. It never touches the browser.
 //
 // ─────────────────────────────────────────────────────────────
-// WHERE YOUR GEMINI KEY GOES — step by step
+// WHERE YOUR GROQ KEY GOES — step by step
 // ─────────────────────────────────────────────────────────────
-// 1. Get a key from https://aistudio.google.com/apikey (free tier available).
+// 1. Get a key from https://console.groq.com/keys (free tier, no credit card
+//    required to start).
 // 2. Put this file at:  <your-repo-root>/api/artisan-ai.js
-//    (same folder structure as index.html — Vercel auto-detects anything under /api)
 // 3. In your Vercel project dashboard:
-//      Settings -> Environment Variables -> Add New
-//      Name:  GEMINI_API_KEY
-//      Value: <paste your key>
-//      Environment: Production (and Preview, if you want it working on preview deploys too)
-// 4. Redeploy. That's it -- the key now lives only on Vercel's servers, in
-//    process.env.GEMINI_API_KEY, and is never sent to or visible from the browser.
+//      Settings -> Environment Variables -> Add Environment Variable
+//      Key:   GROQ_API_KEY
+//      Value: <paste your key, no quotes, no extra spaces>
+//      Type:  Secret
+//      Environment: Production (and Preview/Development if you want those too)
+// 4. Redeploy (Deployments tab -> "..." on the latest one -> Redeploy).
+//    Adding/changing an environment variable does NOT apply to an
+//    already-running deployment — you must redeploy after saving it.
 //
-// NEVER paste the key directly into this file and commit it to GitHub -- anyone
-// who views your repo (or your site's page source) would be able to see it and
-// use it on your bill. Environment variables are the only safe place for it.
+// NEVER paste the key directly into this file and commit it to GitHub.
 // ─────────────────────────────────────────────────────────────
 
-// Try a short list of model names in order, falling back automatically if one
-// returns 404 (Google has been renaming/retiring Gemini versions frequently
-// through 2026 — this makes the widget resilient to that rather than breaking
-// outright every time a model name changes on Google's end).
-const GEMINI_MODEL_CANDIDATES = ['gemini-flash-latest', 'gemini-2.5-flash'];
-const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+// Groq periodically deprecates older models (e.g. the old llama-3.3-70b-versatile
+// and llama-3.1-8b-instant chat models were retired). openai/gpt-oss-120b is the
+// current recommended general-purpose model as of mid-2026. Keeping a short
+// fallback list makes this resilient to the next such change without another
+// full redeploy-and-debug cycle.
+const GROQ_MODEL_CANDIDATES = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 // ─────────────────────────────────────────────────────────────
-// SYSTEM PROMPT -- this is what makes it sound like Artisan AI and not
+// SYSTEM PROMPT — this is what makes it sound like Artisan AI and not
 // "an AI assistant". Keep it in first person, give it a personality tied
 // to the company, and explicitly forbid the generic-chatbot tells.
 // ─────────────────────────────────────────────────────────────
@@ -75,82 +76,79 @@ module.exports = async function handler(req, res) {
 
   const trimmedHistory = Array.isArray(history) ? history.slice(-10) : [];
 
-  const contents = [
+  // Groq's chat completions API is OpenAI-compatible: a flat "messages" array
+  // with role/content, system message included directly (no separate field
+  // like Gemini requires) — simpler and less error-prone than what we had.
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
     ...trimmedHistory.map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: String(m.content || '').slice(0, 2000) }],
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: String(m.content || '').slice(0, 2000),
     })),
-    { role: 'user', parts: [{ text: message }] },
+    { role: 'user', content: message },
   ];
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
-    console.error('GEMINI_API_KEY is not set in the environment.');
+    console.error('GROQ_API_KEY is not set in the environment.');
     return res.status(500).json({ error: 'Server misconfigured' });
   }
 
-  try {
-    const requestBody = JSON.stringify({
-      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents,
-      generationConfig: {
-        temperature: 0.8,
-        maxOutputTokens: 400,
-      },
-      safetySettings: [
-        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
-        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_ONLY_HIGH' },
-      ],
-    });
+  let lastStatus = null;
+  let lastErrText = null;
 
-    let lastStatus = null;
-    let lastErrText = null;
+  for (const model of GROQ_MODEL_CANDIDATES) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
 
-    for (const model of GEMINI_MODEL_CANDIDATES) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
+    let response;
+    try {
+      response = await fetch(GROQ_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.8,
+          max_completion_tokens: 400,
+        }),
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      console.error(`Groq request failed on model "${model}":`, err);
+      lastStatus = 'network_error';
+      lastErrText = String(err);
+      continue; // try next candidate on a network-level failure too
+    }
+    clearTimeout(timer);
 
-      let response;
-      try {
-        response = await fetch(`${GEMINI_BASE_URL}/${model}:generateContent?key=${apiKey}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: requestBody,
-        });
-      } finally {
-        clearTimeout(timer);
+    if (response.ok) {
+      const data = await response.json();
+      const reply = data.choices?.[0]?.message?.content;
+      if (!reply) {
+        console.error(`Groq (${model}) returned no usable text:`, JSON.stringify(data));
+        return res.status(502).json({ error: 'Empty response from model' });
       }
-
-      if (response.ok) {
-        const data = await response.json();
-        const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!reply) {
-          console.error(`Gemini (${model}) returned no usable text:`, JSON.stringify(data));
-          return res.status(502).json({ error: 'Empty response from model' });
-        }
-        return res.status(200).json({ reply: reply.trim() });
-      }
-
-      lastStatus = response.status;
-      lastErrText = await response.text();
-      console.error(`Gemini API error on model "${model}":`, lastStatus, lastErrText);
-
-      // Fall through to the next candidate on 404 (model not found/renamed)
-      // or 503 (Google's servers temporarily overloaded — worth trying a
-      // different model rather than failing outright). Any other error
-      // (auth, quota, bad request) won't be fixed by switching models, so
-      // fail fast instead of wasting the remaining time budget.
-      if (lastStatus !== 404 && lastStatus !== 503) {
-        return res.status(502).json({ error: 'Upstream API error' });
-      }
+      return res.status(200).json({ reply: reply.trim() });
     }
 
-    // Every candidate model 404'd — genuinely nothing left to try.
-    console.error('All Gemini model candidates returned 404:', GEMINI_MODEL_CANDIDATES, lastStatus, lastErrText);
-    return res.status(502).json({ error: 'Upstream API error' });
-  } catch (err) {
-    console.error('artisan-ai handler error:', err);
-    return res.status(500).json({ error: 'Server error' });
+    lastStatus = response.status;
+    lastErrText = await response.text();
+    console.error(`Groq API error on model "${model}":`, lastStatus, lastErrText);
+
+    // Only move to the next candidate if the model itself is the problem
+    // (not found / decommissioned) or the service is briefly overloaded.
+    // Auth (401/403) or bad-request (400) errors won't be fixed by trying
+    // a different model, so fail fast instead.
+    if (lastStatus !== 404 && lastStatus !== 503) {
+      return res.status(502).json({ error: 'Upstream API error' });
+    }
   }
+
+  console.error('All Groq model candidates failed:', GROQ_MODEL_CANDIDATES, lastStatus, lastErrText);
+  return res.status(502).json({ error: 'Upstream API error' });
 };
