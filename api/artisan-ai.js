@@ -26,7 +26,7 @@
 // returns 404 (Google has been renaming/retiring Gemini versions frequently
 // through 2026 — this makes the widget resilient to that rather than breaking
 // outright every time a model name changes on Google's end).
-const GEMINI_MODEL_CANDIDATES = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+const GEMINI_MODEL_CANDIDATES = ['gemini-flash-latest', 'gemini-2.5-flash'];
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 // ─────────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ module.exports = async function handler(req, res) {
 
     for (const model of GEMINI_MODEL_CANDIDATES) {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000);
+      const timer = setTimeout(() => controller.abort(), 8000);
 
       let response;
       try {
@@ -136,10 +136,12 @@ module.exports = async function handler(req, res) {
       lastErrText = await response.text();
       console.error(`Gemini API error on model "${model}":`, lastStatus, lastErrText);
 
-      // Only fall through to the next candidate on a 404 (model not found/
-      // renamed on Google's side) — any other error (auth, quota, bad request)
-      // won't be fixed by trying a different model name, so fail fast instead.
-      if (lastStatus !== 404) {
+      // Fall through to the next candidate on 404 (model not found/renamed)
+      // or 503 (Google's servers temporarily overloaded — worth trying a
+      // different model rather than failing outright). Any other error
+      // (auth, quota, bad request) won't be fixed by switching models, so
+      // fail fast instead of wasting the remaining time budget.
+      if (lastStatus !== 404 && lastStatus !== 503) {
         return res.status(502).json({ error: 'Upstream API error' });
       }
     }
