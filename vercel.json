@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/artisan-ai.js": {
-      "maxDuration": 30
-    }
-  }
-}
