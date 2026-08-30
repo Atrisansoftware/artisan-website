@@ -22,8 +22,12 @@
 // use it on your bill. Environment variables are the only safe place for it.
 // ─────────────────────────────────────────────────────────────
 
-const GEMINI_MODEL = 'gemini-2.5-flash'; // fast + cheap, good for a chat widget
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+// Try a short list of model names in order, falling back automatically if one
+// returns 404 (Google has been renaming/retiring Gemini versions frequently
+// through 2026 — this makes the widget resilient to that rather than breaking
+// outright every time a model name changes on Google's end).
+const GEMINI_MODEL_CANDIDATES = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.0-flash'];
+const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 // ─────────────────────────────────────────────────────────────
 // SYSTEM PROMPT -- this is what makes it sound like Artisan AI and not
@@ -86,43 +90,63 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12000);
-
-    const response = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.8,
-          maxOutputTokens: 400,
-        },
-        safetySettings: [
-          { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
-          { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_ONLY_HIGH' },
-        ],
-      }),
+    const requestBody = JSON.stringify({
+      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents,
+      generationConfig: {
+        temperature: 0.8,
+        maxOutputTokens: 400,
+      },
+      safetySettings: [
+        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
+        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_ONLY_HIGH' },
+      ],
     });
-    clearTimeout(timer);
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error('Gemini API error:', response.status, errText);
-      return res.status(502).json({ error: 'Upstream API error' });
+    let lastStatus = null;
+    let lastErrText = null;
+
+    for (const model of GEMINI_MODEL_CANDIDATES) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12000);
+
+      let response;
+      try {
+        response = await fetch(`${GEMINI_BASE_URL}/${model}:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: requestBody,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (response.ok) {
+        const data = await response.json();
+        const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!reply) {
+          console.error(`Gemini (${model}) returned no usable text:`, JSON.stringify(data));
+          return res.status(502).json({ error: 'Empty response from model' });
+        }
+        return res.status(200).json({ reply: reply.trim() });
+      }
+
+      lastStatus = response.status;
+      lastErrText = await response.text();
+      console.error(`Gemini API error on model "${model}":`, lastStatus, lastErrText);
+
+      // Only fall through to the next candidate on a 404 (model not found/
+      // renamed on Google's side) — any other error (auth, quota, bad request)
+      // won't be fixed by trying a different model name, so fail fast instead.
+      if (lastStatus !== 404) {
+        return res.status(502).json({ error: 'Upstream API error' });
+      }
     }
 
-    const data = await response.json();
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!reply) {
-      console.error('Gemini returned no usable text:', JSON.stringify(data));
-      return res.status(502).json({ error: 'Empty response from model' });
-    }
-
-    return res.status(200).json({ reply: reply.trim() });
+    // Every candidate model 404'd — genuinely nothing left to try.
+    console.error('All Gemini model candidates returned 404:', GEMINI_MODEL_CANDIDATES, lastStatus, lastErrText);
+    return res.status(502).json({ error: 'Upstream API error' });
   } catch (err) {
     console.error('artisan-ai handler error:', err);
     return res.status(500).json({ error: 'Server error' });
