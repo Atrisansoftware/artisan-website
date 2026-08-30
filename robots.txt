@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://artisanengineering.com.np/sitemap.xml
