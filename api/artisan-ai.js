@@ -1,20 +1,63 @@
 // api/artisan-ai.js
 // Serverless function (Vercel-style) that powers the "Artisan AI" chat widget.
-// Uses Groq (OpenAI-compatible chat completions). The frontend calls
-// POST /api/artisan-ai — this file is the ONLY place your Groq API key
-// should ever exist. It never touches the browser.
+// Routes across FOUR AI providers with automatic failover: Groq -> OpenRouter
+// -> Nvidia NIM -> Gemini (last resort). If one is down, slow, or rate-limited,
+// the next is tried automatically within the same request. The frontend calls
+// POST /api/artisan-ai — this file is the ONLY place any of these keys should
+// ever exist. None of them ever touch the browser.
 //
 // ─────────────────────────────────────────────────────────────
-// SETUP
+// SETUP — you don't need all four to start. Missing keys are skipped
+// automatically (that provider is just left out of the rotation).
 // ─────────────────────────────────────────────────────────────
-// 1. Get a key from https://console.groq.com/keys
-// 2. Vercel -> Settings -> Environment Variables:
-//      Key: GROQ_API_KEY   Value: <your key>   Type: Secret   Env: Production
-// 3. Redeploy after saving (env var changes don't apply retroactively).
+// Groq:        https://console.groq.com/keys              -> GROQ_API_KEY
+// OpenRouter:  https://openrouter.ai/keys                  -> OPENROUTER_API_KEY
+// Nvidia NIM:  https://build.nvidia.com (API Catalog)      -> NVIDIA_API_KEY
+// Gemini:      https://aistudio.google.com/apikey          -> GEMINI_API_KEY
+//
+// Vercel -> Settings -> Environment Variables -> add each as Type: Secret,
+// Environment: Production. Redeploy after saving (env var changes don't
+// apply retroactively to an already-running deployment).
 // ─────────────────────────────────────────────────────────────
 
-const GROQ_MODEL_CANDIDATES = ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'];
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+// Three of the four providers speak the same OpenAI-compatible chat-completions
+// format (Groq, OpenRouter, Nvidia NIM) — one shared calling function handles
+// all three. Gemini uses a different request/response shape entirely and is
+// handled separately, as a text-only last resort (no tool-calling — see note
+// further down on why that trade-off is intentional).
+//
+// Order matters: this is fallback priority, not "best model" ranking. Groq
+// first because it's proven fast and reliable for this project. OpenRouter's
+// "openrouter/free" model is OpenRouter's OWN auto-router across whatever free
+// models are currently up — deliberately NOT a specific model name, because
+// OpenRouter's free-tier catalog rotates models in and out with no warning,
+// and hardcoding one specific "some-model:free" ID is exactly the kind of
+// brittleness that caused problems before. Nvidia's hosted trial endpoint can
+// have slow cold-starts under load, hence last before the Gemini fallback.
+const OPENAI_COMPATIBLE_PROVIDERS = [
+  {
+    name: 'groq',
+    envKey: 'GROQ_API_KEY',
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    model: 'openai/gpt-oss-120b',
+    extraHeaders: {},
+  },
+  {
+    name: 'openrouter',
+    envKey: 'OPENROUTER_API_KEY',
+    url: 'https://openrouter.ai/api/v1/chat/completions',
+    model: 'openrouter/free',
+    // OpenRouter-recommended (not required) — identifies the app in their dashboard.
+    extraHeaders: { 'HTTP-Referer': 'https://artisanengineering.com.np', 'X-Title': 'Artisan AI' },
+  },
+  {
+    name: 'nvidia',
+    envKey: 'NVIDIA_API_KEY',
+    url: 'https://integrate.api.nvidia.com/v1/chat/completions',
+    model: 'meta/llama-3.3-70b-instruct',
+    extraHeaders: {},
+  },
+];
 
 // Reuses the exact same inbox your contact form already delivers to —
 // no new destination, no new company info introduced.
@@ -231,49 +274,137 @@ async function logConversationEmail(args) {
   }
 }
 
-async function callGroq(messages, tools) {
-  let lastStatus = null;
-  let lastErrText = null;
+// Calls one OpenAI-compatible provider (Groq, OpenRouter, or Nvidia NIM — they
+// all take the same request/response shape). Returns a normalized result so
+// the router below doesn't need to know which provider it just tried.
+async function callOpenAICompatible(provider, messages, tools, deadline) {
+  const remaining = deadline - Date.now();
+  if (remaining < 1200) return { ok: false, providerName: provider.name }; // not enough time left to bother
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.min(7000, remaining));
+  let response;
+  try {
+    response = await fetch(provider.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env[provider.envKey]}`,
+        ...provider.extraHeaders,
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: provider.model,
+        messages,
+        tools,
+        temperature: 0.8,
+        max_completion_tokens: 500,
+      }),
+    });
+  } catch (err) {
+    clearTimeout(timer);
+    console.error(`[${provider.name}] request failed:`, err);
+    return { ok: false, providerName: provider.name };
+  }
+  clearTimeout(timer);
 
-  for (const model of GROQ_MODEL_CANDIDATES) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
-    let response;
-    try {
-      response = await fetch(GROQ_URL, {
+  if (!response.ok) {
+    const errText = await response.text();
+    console.error(`[${provider.name}] API error:`, response.status, errText);
+    return { ok: false, providerName: provider.name };
+  }
+
+  const data = await response.json();
+  const choice = data.choices?.[0];
+  if (!choice) {
+    console.error(`[${provider.name}] returned no choices:`, JSON.stringify(data));
+    return { ok: false, providerName: provider.name };
+  }
+  return { ok: true, providerName: provider.name, message: choice.message };
+}
+
+// Gemini's REST API uses a different shape entirely (system_instruction,
+// contents[] with role user/model, parts[].text) — kept separate rather than
+// forced into the OpenAI-compatible caller above. Used as a text-only LAST
+// RESORT: no tool-calling here. Translating function-calling into Gemini's
+// different tool-call format would add real complexity for a provider that's
+// only ever reached when three other providers have already failed — better
+// to degrade gracefully to plain conversation than risk a fragile edge case
+// nobody can test regularly. If Gemini is the one answering, the system
+// prompt's instruction to use send_inquiry simply won't fire that turn; the
+// AI still has the contact phone/WhatsApp/email in its knowledge base to give
+// the customer directly instead.
+async function callGemini(messages, deadline) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return { ok: false, providerName: 'gemini' };
+
+  const remaining = deadline - Date.now();
+  if (remaining < 1200) return { ok: false, providerName: 'gemini' };
+
+  const systemMsg = messages.find(m => m.role === 'system');
+  const conversationMsgs = messages.filter(m => m.role === 'user' || m.role === 'assistant');
+
+  const contents = conversationMsgs.map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: String(m.content || '') }],
+  }));
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.min(7000, remaining));
+  let response;
+  try {
+    response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`,
+      {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
-        },
+        headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          model,
-          messages,
-          tools,
-          temperature: 0.8,
-          max_completion_tokens: 500,
+          system_instruction: { parts: [{ text: systemMsg?.content || '' }] },
+          contents,
+          generationConfig: { temperature: 0.8, maxOutputTokens: 400 },
         }),
-      });
-    } catch (err) {
-      clearTimeout(timer);
-      lastStatus = 'network_error';
-      lastErrText = String(err);
-      console.error(`Groq request failed on model "${model}":`, err);
-      continue;
-    }
+      }
+    );
+  } catch (err) {
     clearTimeout(timer);
-
-    if (response.ok) return { ok: true, data: await response.json() };
-
-    lastStatus = response.status;
-    lastErrText = await response.text();
-    console.error(`Groq API error on model "${model}":`, lastStatus, lastErrText);
-    if (lastStatus !== 404 && lastStatus !== 503) {
-      return { ok: false, status: lastStatus, errText: lastErrText };
-    }
+    console.error('[gemini] request failed:', err);
+    return { ok: false, providerName: 'gemini' };
   }
-  return { ok: false, status: lastStatus, errText: lastErrText };
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    console.error('[gemini] API error:', response.status, await response.text());
+    return { ok: false, providerName: 'gemini' };
+  }
+
+  const data = await response.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) {
+    console.error('[gemini] returned no usable text:', JSON.stringify(data));
+    return { ok: false, providerName: 'gemini' };
+  }
+  return { ok: true, providerName: 'gemini', message: { role: 'assistant', content: text } };
+}
+
+// The router: tries each provider in priority order and uses the first one
+// that responds successfully. A provider missing its API key is skipped
+// silently (not an error — just not configured yet). Once a provider answers
+// successfully within a request, subsequent tool-calling rounds in that same
+// request re-try providers from the top again — cheap, since a provider that
+// just worked will almost always work again immediately after.
+async function routeToAI(messages, tools, deadline) {
+  for (const provider of OPENAI_COMPATIBLE_PROVIDERS) {
+    if (Date.now() >= deadline) break; // out of time — stop trying, fail cleanly below
+    if (!process.env[provider.envKey]) continue; // not configured — skip, don't fail
+    const result = await callOpenAICompatible(provider, messages, tools, deadline);
+    if (result.ok) return result;
+  }
+  // Last resort — Gemini, text-only, no tools.
+  if (Date.now() < deadline && process.env.GEMINI_API_KEY) {
+    const result = await callGemini(messages, deadline);
+    if (result.ok) return result;
+  }
+  return { ok: false, providerName: null };
 }
 
 module.exports = async function handler(req, res) {
@@ -288,8 +419,11 @@ module.exports = async function handler(req, res) {
   if (message.length > 800) {
     return res.status(400).json({ error: 'Message too long' });
   }
-  if (!process.env.GROQ_API_KEY) {
-    console.error('GROQ_API_KEY is not set in the environment.');
+  const hasAnyProvider =
+    process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY ||
+    process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
+  if (!hasAnyProvider) {
+    console.error('No AI provider API key is set in the environment (need at least one of GROQ_API_KEY, OPENROUTER_API_KEY, NVIDIA_API_KEY, GEMINI_API_KEY).');
     return res.status(500).json({ error: 'Server misconfigured' });
   }
 
@@ -308,16 +442,27 @@ module.exports = async function handler(req, res) {
   // the conversation, then also sending an inquiry). A fixed two-pass version
   // would incorrectly error out if a second round of tool calls happened.
   // Capped at 4 rounds so a misbehaving model can't loop forever.
+  // One shared time budget for the WHOLE request, no matter how many
+  // providers get tried or how many tool-calling rounds happen. This is the
+  // correct fix for multi-provider-times-multi-round timing — bounding each
+  // individual number separately breaks again the moment anything changes
+  // (a provider added, a timeout tweaked). 50s leaves real margin under the
+  // 60s ceiling in vercel.json for response serialization and overhead.
+  const deadline = Date.now() + 50000;
+
   const MAX_TOOL_ROUNDS = 3;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const result = await callGroq(conversation, TOOLS);
+    if (Date.now() >= deadline) {
+      console.error('Time budget exhausted before completing the request.');
+      return res.status(502).json({ error: 'Upstream API error' });
+    }
+    const result = await routeToAI(conversation, TOOLS, deadline);
     if (!result.ok) return res.status(502).json({ error: 'Upstream API error' });
 
-    const choice = result.data.choices?.[0];
-    const toolCalls = choice?.message?.tool_calls;
+    const toolCalls = result.message?.tool_calls;
 
     if (!toolCalls || toolCalls.length === 0) {
-      const reply = choice?.message?.content;
+      const reply = result.message?.content;
       if (!reply) return res.status(502).json({ error: 'Empty response from model' });
       return res.status(200).json({ reply: reply.trim() });
     }
@@ -344,7 +489,7 @@ module.exports = async function handler(req, res) {
       };
     }));
 
-    conversation = [...conversation, choice.message, ...toolResultMessages];
+    conversation = [...conversation, result.message, ...toolResultMessages];
   }
 
   // Exhausted the round cap without a final text reply — fail safely rather
